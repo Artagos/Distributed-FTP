@@ -295,7 +295,6 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
     '''
 
     while True:
-        time.sleep(2)
         data = await reader.read(1024) # Read data from client
         if not data:
             print(f"Connection closed from client {addr}")
