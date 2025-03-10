@@ -11,9 +11,22 @@ import stat
 import json
 import socket
 import uuid
+import struct
+import threading
+
 
 
 FILESYSTEM_JSON = "filesystem.json"
+BROADCAST_ADDRESS = '<broadcast>'
+BROADCAST_PORT = 50000
+MULTICAST_GROUP = '224.0.0.1'
+MULTICAST_PORT = 10000
+
+#Default PORT for RPC communication
+KDM_PORT=8000
+
+#Default PORT for TCP communication
+TCP_PORT=21
 class File:
     """Representa un archivo en el sistema de archivos."""
     def __init__(self, name,key ,content="",permissions=0o644):
@@ -235,6 +248,7 @@ async def retrieve_data(node, key):
 
 async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
     """Handles remote commands sent via socket"""
+    
     addr = writer.get_extra_info("peername") #<---------------
     print(f"New connection from {addr}")
     writer.write(b"220 FTP service ready.\r\n") #<---------------b\r\n asi????
@@ -281,8 +295,8 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
     '''
 
     while True:
-        
-        data = await reader.readline() # Read data from client
+        time.sleep(2)
+        data = await reader.read(1024) # Read data from client
         if not data:
             print(f"Connection closed from client {addr}")
             break
@@ -294,7 +308,7 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
                 with open(FILESYSTEM_JSON, "w") as file:
                     json.dump(json.loads(jsonKad.decode().replace("'", '"')), file, indent=4)
                 fileSystem.load_from_json(FILESYSTEM_JSON)
-            print("SE ACTUALIZO EL SISTEMA DE FICHEROS")
+                print("SE ACTUALIZO EL SISTEMA DE FICHEROS")
         except Exception as e:
             print(f"Error al recuperar el fileSystem:  {e}")
 
@@ -311,6 +325,9 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
         action, *args = command.split(' ', 1)
         arg = args[0] if args else None
         print (command)
+        
+        if(arg=='..'):
+            action="CDUP"
 
         if action == "USER":
             username = arg
@@ -367,6 +384,7 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
                     with open(FILESYSTEM_JSON, "r") as file:
                         data = json.load(file)
                     await node.set(FILESYSTEM_JSON, str(data).encode())
+                    print("SE ENVIO EL SISTEMA DE FICHEROS")
                     
                     writer.write(f'257 "{dir_name}" created.\r\n'.encode())
                 else:
@@ -503,6 +521,7 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
                     passive_socket = None
                     print("cerrada la conexion")
                     writer.write(b'226 Directory send OK.\r\n')
+                    print("se llega qui")
                     writer_N=None
                     reader_N=None
                     pORT_ip=None
@@ -726,8 +745,8 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
             ip_parts = local_ip.split('.')
             ip_response = ','.join(ip_parts + [str(p1), str(p2)])
             
+            await passive_socket.start_serving()
             writer.write(f'227 Entering Passive Mode ({ip_response}).\r\n'.encode())
-
             await writer.drain()
 
         elif action =="PORT":
@@ -1025,7 +1044,7 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
             await writer.drain()
         
         elif action == "STAT":
-            if not args:
+            if not arg:
                 # STAT without arguments - show server status
                 writer.write(b"211-FTP Server Status:\r\n")
                 await writer.drain()
@@ -1100,6 +1119,7 @@ async def handle_client(reader, writer, node: Server, fileSystem:FileSystem):
             print(f"Command not implemented: {action}")
             writer.write(b"502 Command not implemented.\r\n")
             await writer.drain()
+        
 
     print(f"Connection closed from {addr}")
     writer.close()
@@ -1125,27 +1145,101 @@ async def start_tcp_server(node:Server, port):
 
     async with server:
         await server.serve_forever()
+        
+   
 
 async def run_node(port, command_port, bootstrap_ip=None, bootstrap_port=None):
     node = Server(storage=ForgetfulStorage())
     await node.listen(port)
-
+    
+    
     if bootstrap_ip and bootstrap_port:
         await node.bootstrap([(bootstrap_ip, bootstrap_port)])
+        
+        node.health_check_loop= asyncio.create_task(node._health_check())
         print(f"Node started on port {port} and connected to {bootstrap_ip}:{bootstrap_port}")
     else:
+        node.health_check_loop= asyncio.create_task(node._health_check())
         print(f"Node started on port {port} (standalone)")
 
     asyncio.create_task(start_tcp_server(node, command_port))  # Start TCP server for remote commands
 
     await asyncio.Future()  # Keeps the node running
+def multicast_listener(Port):
+        """
+        Escucha mensajes multicast de clientes y otros servidores.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
+          # Set timeout to 10 seconds
+        sock.settimeout(10.0)
+        try:
+            sock.bind(('', MULTICAST_PORT))
+        except Exception as e:
+            print(f"Error al enlazar multicast: {e}")
+            return
+        
+        mreq = struct.pack("4sl", socket.inet_aton(MULTICAST_GROUP), socket.INADDR_ANY)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
+
+        print(f"[*] Server multicast listener iniciado en {MULTICAST_GROUP}:{MULTICAST_PORT}")
+        start_time = time.time()
+        while (time.time() - start_time) < 10:
+            try:
+                data, addr = sock.recvfrom(1024)
+                msg = data.decode('utf-8').strip()
+                parts = msg.split(',')
+
+
+                ip = get_local_ip()
+                if parts[0] == "SERVER_ANNOUNCE" :
+                    server_ip = parts[1]
+                    server_port = int(parts[2])
+                    if server_ip != ip:
+                        print(f"🔗 Descubrí otro servidor: {server_ip}:{server_port}")
+                        return (server_ip,server_port)
+            except socket.timeout:
+                print("Timeout reached after 10 seconds")
+                break            
+            except Exception as e:
+                sock.close()
+                print(f"Error en multicast listener: {e}")
+def announce_server():
+        """
+        Envía periódicamente un mensaje multicast anunciando la IP del servidor.
+        """
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        ttl = struct.pack('b', 1)
+        sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, ttl)
+
+        ip= get_local_ip()
+        print(f"📢 Anunciando servidor {ip}:{9000} vía multicast")
+        while True:
+            try:
+                msg = f"SERVER_ANNOUNCE,{ip},{9000}"
+                
+                sock.sendto(msg.encode('utf-8'), (MULTICAST_GROUP, MULTICAST_PORT))
+                
+            except Exception as e:
+                print(f"Error enviando anuncio multicast: {e}")
+            time.sleep(5)  # Enviar cada 5 segundos
+            
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, required=True, help="Port to run the Kademlia node")
-    parser.add_argument("--command_port", type=int, required=True, help="Port to receive FTP client-like commands")
-    parser.add_argument("--bootstrap_ip", type=str, help="Bootstrap node IP")
-    parser.add_argument("--bootstrap_port", type=int, help="Bootstrap node Port")
+    
 
     args = parser.parse_args()
-    asyncio.run(run_node(args.port, args.command_port, args.bootstrap_ip, args.bootstrap_port))
+    threading.Thread(target=announce_server, daemon=True).start()
+    
+    #listens for 10 seconds
+    node_found= multicast_listener(KDM_PORT)
+    
+    
+    bootstrap_ip=None
+    bootstrap_port=None
+    if(node_found):
+        bootstrap_ip=node_found[0]
+        bootstrap_port=node_found[1]
+    print(f'se encontro Server {node_found}')
+    asyncio.run(run_node(KDM_PORT, TCP_PORT, bootstrap_ip, KDM_PORT))
